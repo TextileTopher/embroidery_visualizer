@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+.venv/
+venv/
+*.log
+
+# --- Blender ---
+*.blend1
+*.blend2
+*.blend@
+*.blend~
+BlenderSetup.blend
+
+# --- Archives & temporary files ---
+*.zip
+*.tar
+*.tar.gz
+processing_log.csv
+
+# --- Output folders ---
+output/
+output2/
+input_PES_finished/
+
+# --- IDE/system ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Backups / Misc ---
+requirements copy.txt

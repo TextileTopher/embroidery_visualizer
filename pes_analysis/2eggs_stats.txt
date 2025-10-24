@@ -1,0 +1,9 @@
+File Statistics for 2eggs
+==================================================
+
+Total file size: 0 bytes
+Number of blocks (16 bytes): 0
+Remaining bytes: 0
+
+Byte frequency analysis:
+------------------------------
