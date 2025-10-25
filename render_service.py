@@ -1,5 +1,4 @@
 import io
-import json
 import logging
 import os
 import shutil
@@ -7,8 +6,10 @@ import subprocess
 import tempfile
 import time
 import uuid
+import zipfile
+from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 BLENDER_BINARY = "/opt/blender/blender"
@@ -55,7 +56,18 @@ def _dedupe_path(candidate_path: str) -> str:
         counter += 1
 
 
-def run_blender_render(input_path: str, output_path: str) -> float:
+def run_blender_render(
+    input_path: str,
+    fast_output_path: str,
+    *,
+    resolution: int,
+    camera: str,
+    thread_thickness: float,
+    fast_samples: Optional[int] = None,
+    legacy_output_path: Optional[str] = None,
+    legacy_resolution: Optional[int] = None,
+    legacy_samples: Optional[int] = None,
+) -> float:
     cmd = [
         BLENDER_BINARY,
         "-b",
@@ -66,14 +78,23 @@ def run_blender_render(input_path: str, output_path: str) -> float:
         "-i",
         input_path,
         "-o",
-        output_path,
+        fast_output_path,
         "--resolution",
-        str(DEFAULT_RESOLUTION),
+        str(resolution),
         "--camera",
-        DEFAULT_CAMERA,
+        camera,
         "--thread_thickness",
-        str(DEFAULT_THREAD_THICKNESS),
+        str(thread_thickness),
     ]
+    if fast_samples is not None:
+        cmd.extend(["--fast_samples", str(fast_samples)])
+    if legacy_output_path:
+        cmd.extend(["--legacy_output", legacy_output_path])
+        if legacy_resolution is not None:
+            cmd.extend(["--legacy_resolution", str(legacy_resolution)])
+        if legacy_samples is not None:
+            cmd.extend(["--legacy_samples", str(legacy_samples)])
+
     logger.info("Running Blender: %s", " ".join(cmd))
     start = time.perf_counter()
     try:
@@ -88,7 +109,16 @@ def run_blender_render(input_path: str, output_path: str) -> float:
 
 
 @app.post("/render", response_class=StreamingResponse)
-async def render_image(file: UploadFile = File(...)):
+async def render_image(
+    file: UploadFile = File(...),
+    mode: str = Form("fast"),
+    resolution: Optional[int] = Form(None),
+    camera: str = Form(DEFAULT_CAMERA),
+    thread_thickness: float = Form(DEFAULT_THREAD_THICKNESS),
+    fast_samples: Optional[int] = Form(None),
+    legacy_resolution: Optional[int] = Form(None),
+    legacy_samples: Optional[int] = Form(None),
+):
     if not file.filename:
         raise HTTPException(status_code=400, detail="File upload must include a filename.")
     base_name, extension = os.path.splitext(file.filename)
@@ -97,40 +127,108 @@ async def render_image(file: UploadFile = File(...)):
     safe_base = base_name.strip() or "upload"
     logger.info("Request received for %s", file.filename)
 
+    requested_mode = (mode or "fast").strip().lower()
+    if requested_mode not in {"fast", "legacy", "both"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: fast, legacy, both.")
+
+    effective_resolution = resolution or DEFAULT_RESOLUTION
+    legacy_requested = requested_mode in {"legacy", "both"}
+
+    input_backup = None
+    fast_backup = None
+    legacy_backup = None
+    timestamp = int(time.time())
+    elapsed = 0.0
+
     with tempfile.TemporaryDirectory(prefix="embroidery_render_") as tmpdir:
         input_path = os.path.join(tmpdir, f"{uuid.uuid4().hex}{extension}")
-        output_path = os.path.join(tmpdir, "render.png")
+        fast_output_path = os.path.join(tmpdir, "fast.png")
+        legacy_output_path = os.path.join(tmpdir, "legacy.png") if legacy_requested else None
 
         data = await file.read()
         with open(input_path, "wb") as f:
             f.write(data)
 
+        input_backup = _dedupe_path(os.path.join(processed_dir, f"{safe_base}_{timestamp}{extension.lower()}"))
+        shutil.copyfile(input_path, input_backup)
+        logger.info("Backed up input to %s", input_backup)
+
         try:
-            elapsed = run_blender_render(input_path, output_path)
+            elapsed = run_blender_render(
+                input_path,
+                fast_output_path,
+                resolution=effective_resolution,
+                camera=camera,
+                thread_thickness=thread_thickness,
+                fast_samples=fast_samples,
+                legacy_output_path=legacy_output_path,
+                legacy_resolution=legacy_resolution,
+                legacy_samples=legacy_samples,
+            )
         except RuntimeError as exc:
             logger.exception("Render failed for '%s'", file.filename)
             raise HTTPException(status_code=500, detail=f"Render failed: {exc}") from exc
 
-        if not os.path.exists(output_path):
-            logger.error("Render output missing at %s", output_path)
-            raise HTTPException(status_code=500, detail="Render completed but no image was generated.")
+        if not os.path.exists(fast_output_path):
+            logger.error("Fast render output missing at %s", fast_output_path)
+            raise HTTPException(status_code=500, detail="Fast render completed but no image was generated.")
 
-        timestamp = int(time.time())
-        input_backup = _dedupe_path(os.path.join(processed_dir, f"{safe_base}_{timestamp}{extension.lower()}"))
-        output_backup = _dedupe_path(os.path.join(processed_dir, f"{safe_base}_{timestamp}.png"))
-        shutil.copyfile(input_path, input_backup)
-        shutil.copyfile(output_path, output_backup)
-        logger.info("Backed up input to %s and output to %s", input_backup, output_backup)
+        fast_backup = _dedupe_path(os.path.join(processed_dir, f"{safe_base}_{timestamp}_fast.png"))
+        shutil.copyfile(fast_output_path, fast_backup)
 
-    with open(output_backup, "rb") as png_file:
-        png_bytes = png_file.read()
+        if legacy_requested:
+            if not legacy_output_path or not os.path.exists(legacy_output_path):
+                logger.error("Legacy render output missing at %s", legacy_output_path)
+                raise HTTPException(status_code=500, detail="Legacy render was requested but no image was generated.")
+            legacy_backup = _dedupe_path(os.path.join(processed_dir, f"{safe_base}_{timestamp}_legacy.png"))
+            shutil.copyfile(legacy_output_path, legacy_backup)
+            logger.info(
+                "Backed up fast output to %s and legacy output to %s",
+                fast_backup,
+                legacy_backup,
+            )
+        else:
+            logger.info("Backed up fast output to %s", fast_backup)
 
     headers = {
-        "Content-Disposition": f'attachment; filename="{os.path.splitext(file.filename)[0]}.png"',
         "X-Render-Time": f"{elapsed:.2f}",
-        "X-Input-Backup": os.path.relpath(input_backup, repo_dir),
-        "X-Output-Backup": os.path.relpath(output_backup, repo_dir),
+        "X-Mode": requested_mode,
     }
+    if input_backup:
+        headers["X-Input-Backup"] = os.path.relpath(input_backup, repo_dir)
+    if fast_backup:
+        headers["X-Fast-Output-Backup"] = os.path.relpath(fast_backup, repo_dir)
+    if legacy_backup:
+        headers["X-Legacy-Output-Backup"] = os.path.relpath(legacy_backup, repo_dir)
+
+    if requested_mode == "both":
+        archive_name = f"{safe_base}_{timestamp}.zip"
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            if fast_backup:
+                archive.write(fast_backup, arcname=f"{safe_base}_fast.png")
+            if legacy_backup:
+                archive.write(legacy_backup, arcname=f"{safe_base}_legacy.png")
+        zip_buffer.seek(0)
+        headers["Content-Disposition"] = f'attachment; filename="{archive_name}"'
+        return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+    if requested_mode == "legacy":
+        if not legacy_backup:
+            raise HTTPException(status_code=500, detail="Legacy render requested but no image was produced.")
+        target_backup = legacy_backup
+        filename = f"{safe_base}_legacy.png"
+    else:
+        target_backup = fast_backup
+        filename = f"{safe_base}_fast.png"
+
+    if not target_backup or not os.path.exists(target_backup):
+        raise HTTPException(status_code=500, detail="Requested render completed but could not locate the output file.")
+
+    with open(target_backup, "rb") as png_file:
+        png_bytes = png_file.read()
+
+    headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png", headers=headers)
 
 
@@ -145,5 +243,7 @@ async def root():
         "message": "Embroidery render API",
         "submit_endpoint": "/render",
         "docs": "/docs",
-        "example_curl": 'curl -F "file=@path/to/design.PES" http://localhost:8000/render --output design.png',
+        "example_fast": 'curl -F "mode=fast" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_fast.png',
+        "example_legacy": 'curl -F "mode=legacy" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_legacy.png',
+        "example_both": 'curl -F "mode=both" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_outputs.zip',
     }
