@@ -51,18 +51,23 @@ parser.add_argument("-v", "--output_video", required=True, help="Output video fi
 args = parser.parse_args(argv)
 script_dir = os.path.dirname(__file__)
 ##################################removed these two lines of code for new batch script
-pes_dir = os.path.join(script_dir, "input_PES")
-input_pes = os.path.join(pes_dir, args.input_pes)
+if os.path.isabs(args.input_pes):
+    input_pes = os.path.abspath(args.input_pes)
+else:
+    pes_dir = os.path.join(script_dir, "input_PES")
+    input_pes = os.path.abspath(os.path.join(pes_dir, args.input_pes))
 
-#modified the above line to this one instead
-#input_pes = os.path.join(script_dir, args.input_pes)
-input_pes = os.path.abspath(input_pes)
+if os.path.isabs(args.output_image):
+    output_image = os.path.abspath(args.output_image)
+else:
+    output_image = os.path.abspath(os.path.join(script_dir, "output", args.output_image))
+os.makedirs(os.path.dirname(output_image), exist_ok=True)
 
-output_dir = os.path.join(script_dir, "output")
-output_image = os.path.join(output_dir, args.output_image)
-output_image = os.path.abspath(output_image)
-output_video = os.path.join(output_dir, args.output_video)
-output_video = os.path.abspath(output_video)
+if os.path.isabs(args.output_video):
+    output_video = os.path.abspath(args.output_video)
+else:
+    output_video = os.path.abspath(os.path.join(script_dir, "output", args.output_video))
+os.makedirs(os.path.dirname(output_video), exist_ok=True)
 
 print("Attempting to import:", input_pes)
 print("Absolute path:", os.path.abspath(input_pes))

@@ -19,7 +19,8 @@ DEFAULT_THREAD_THICKNESS = 0.2
 
 repo_dir = os.path.dirname(os.path.abspath(__file__))
 blend_file = os.path.join(repo_dir, "BlenderSetup.blend")
-blender_script = os.path.join(repo_dir, "blender_render_still.py")
+blender_still_script = os.path.join(repo_dir, "blender_render_still.py")
+blender_video_script = os.path.join(repo_dir, "blender_script.py")
 processed_dir = os.path.join(repo_dir, "processed_files")
 service_log = os.path.join(processed_dir, "render_service.log")
 
@@ -27,8 +28,10 @@ if not os.path.exists(BLENDER_BINARY):
     raise RuntimeError(f"Blender binary not found at {BLENDER_BINARY}")
 if not os.path.exists(blend_file):
     raise RuntimeError(f"Blend file not found at {blend_file}")
-if not os.path.exists(blender_script):
-    raise RuntimeError(f"Blender still script not found at {blender_script}")
+if not os.path.exists(blender_still_script):
+    raise RuntimeError(f"Blender still script not found at {blender_still_script}")
+if not os.path.exists(blender_video_script):
+    raise RuntimeError(f"Blender video script not found at {blender_video_script}")
 os.makedirs(processed_dir, exist_ok=True)
 
 logger = logging.getLogger("embroidery_render_service")
@@ -73,7 +76,7 @@ def run_blender_render(
         "-b",
         blend_file,
         "-P",
-        blender_script,
+        blender_still_script,
         "--",
         "-i",
         input_path,
@@ -108,6 +111,34 @@ def run_blender_render(
     return time.perf_counter() - start
 
 
+def run_blender_video(input_path: str, temp_image_path: str, output_video_path: str) -> float:
+    cmd = [
+        BLENDER_BINARY,
+        "-b",
+        blend_file,
+        "-P",
+        blender_video_script,
+        "--",
+        "-i",
+        input_path,
+        "-o",
+        temp_image_path,
+        "-v",
+        output_video_path,
+    ]
+    logger.info("Running Blender (video): %s", " ".join(cmd))
+    start = time.perf_counter()
+    try:
+        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logger.info("Video Blender stdout:\n%s", proc.stdout.decode("utf-8", errors="ignore"))
+        if proc.stderr:
+            logger.info("Video Blender stderr:\n%s", proc.stderr.decode("utf-8", errors="ignore"))
+    except subprocess.CalledProcessError as exc:
+        logger.error("Video render failed (returncode=%s): %s", exc.returncode, exc.stderr.decode("utf-8", errors="ignore"))
+        raise RuntimeError(exc.stderr.decode("utf-8", errors="ignore") or str(exc)) from exc
+    return time.perf_counter() - start
+
+
 @app.post("/render", response_class=StreamingResponse)
 async def render_image(
     file: UploadFile = File(...),
@@ -118,6 +149,7 @@ async def render_image(
     fast_samples: Optional[int] = Form(None),
     legacy_resolution: Optional[int] = Form(None),
     legacy_samples: Optional[int] = Form(None),
+    include_video: Optional[str] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="File upload must include a filename.")
@@ -131,19 +163,27 @@ async def render_image(
     if requested_mode not in {"fast", "legacy", "both"}:
         raise HTTPException(status_code=400, detail="mode must be one of: fast, legacy, both.")
 
+    include_video_flag = False
+    if include_video is not None:
+        include_video_flag = include_video.strip().lower() in {"1", "true", "yes", "on"}
+
     effective_resolution = resolution or DEFAULT_RESOLUTION
     legacy_requested = requested_mode in {"legacy", "both"}
 
     input_backup = None
     fast_backup = None
     legacy_backup = None
+    video_backup = None
     timestamp = int(time.time())
     elapsed = 0.0
+    video_elapsed = 0.0
 
     with tempfile.TemporaryDirectory(prefix="embroidery_render_") as tmpdir:
         input_path = os.path.join(tmpdir, f"{uuid.uuid4().hex}{extension}")
         fast_output_path = os.path.join(tmpdir, "fast.png")
         legacy_output_path = os.path.join(tmpdir, "legacy.png") if legacy_requested else None
+        video_temp_image_path = os.path.join(tmpdir, "video_frame.png") if include_video_flag else None
+        video_output_path = os.path.join(tmpdir, "render.mp4") if include_video_flag else None
 
         data = await file.read()
         with open(input_path, "wb") as f:
@@ -190,6 +230,25 @@ async def render_image(
         else:
             logger.info("Backed up fast output to %s", fast_backup)
 
+        if include_video_flag:
+            if not video_temp_image_path:
+                video_temp_image_path = os.path.join(tmpdir, "video_frame.png")
+            if not video_output_path:
+                video_output_path = os.path.join(tmpdir, "render.mp4")
+            try:
+                video_elapsed = run_blender_video(input_path, video_temp_image_path, video_output_path)
+            except RuntimeError as exc:
+                logger.exception("Video render failed for '%s'", file.filename)
+                raise HTTPException(status_code=500, detail=f"Video render failed: {exc}") from exc
+
+            if not os.path.exists(video_output_path):
+                logger.error("Video render output missing at %s", video_output_path)
+                raise HTTPException(status_code=500, detail="Video render completed but no video was generated.")
+
+            video_backup = _dedupe_path(os.path.join(processed_dir, f"{safe_base}_{timestamp}_video.mp4"))
+            shutil.copyfile(video_output_path, video_backup)
+            logger.info("Backed up video output to %s", video_backup)
+
     headers = {
         "X-Render-Time": f"{elapsed:.2f}",
         "X-Mode": requested_mode,
@@ -200,18 +259,36 @@ async def render_image(
         headers["X-Fast-Output-Backup"] = os.path.relpath(fast_backup, repo_dir)
     if legacy_backup:
         headers["X-Legacy-Output-Backup"] = os.path.relpath(legacy_backup, repo_dir)
+    if video_backup:
+        headers["X-Video-Output-Backup"] = os.path.relpath(video_backup, repo_dir)
+    if include_video_flag:
+        headers["X-Video-Render-Time"] = f"{video_elapsed:.2f}"
 
-    if requested_mode == "both":
+    needs_archive = include_video_flag or requested_mode == "both"
+
+    if needs_archive:
+        if include_video_flag and not video_backup:
+            raise HTTPException(status_code=500, detail="Video render requested but no video was produced.")
         archive_name = f"{safe_base}_{timestamp}.zip"
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            if fast_backup:
+            if requested_mode in {"fast", "both"}:
+                if not fast_backup or not os.path.exists(fast_backup):
+                    raise HTTPException(status_code=500, detail="Fast render completed but could not locate the output file.")
                 archive.write(fast_backup, arcname=f"{safe_base}_fast.png")
-            if legacy_backup:
+            if requested_mode in {"legacy", "both"}:
+                if not legacy_backup or not os.path.exists(legacy_backup):
+                    raise HTTPException(status_code=500, detail="Legacy render requested but no image was produced.")
                 archive.write(legacy_backup, arcname=f"{safe_base}_legacy.png")
-        zip_buffer.seek(0)
+            if include_video_flag and video_backup and os.path.exists(video_backup):
+                archive.write(video_backup, arcname=f"{safe_base}_video.mp4")
+        zip_bytes = zip_buffer.getvalue()
+        archive_backup = _dedupe_path(os.path.join(processed_dir, archive_name))
+        with open(archive_backup, "wb") as archive_file:
+            archive_file.write(zip_bytes)
+        headers["X-Archive-Backup"] = os.path.relpath(archive_backup, repo_dir)
         headers["Content-Disposition"] = f'attachment; filename="{archive_name}"'
-        return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+        return StreamingResponse(io.BytesIO(zip_bytes), media_type="application/zip", headers=headers)
 
     if requested_mode == "legacy":
         if not legacy_backup:
@@ -246,4 +323,5 @@ async def root():
         "example_fast": 'curl -F "mode=fast" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_fast.png',
         "example_legacy": 'curl -F "mode=legacy" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_legacy.png',
         "example_both": 'curl -F "mode=both" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_outputs.zip',
+        "example_fast_with_video": 'curl -F "mode=fast" -F "include_video=true" -F "file=@path/to/design.PES" http://localhost:8000/render --output design_bundle.zip',
     }

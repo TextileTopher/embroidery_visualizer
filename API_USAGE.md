@@ -55,6 +55,7 @@ file and optional render controls. Include the following fields:
 | `fast_samples`     | No       | Integer   | Blender default | Cycles samples override for the fast render. |
 | `legacy_resolution`| No       | Integer   | `resolution * 2` | Optional override for the legacy render resolution. |
 | `legacy_samples`   | No       | Integer   | Blender default | Cycles samples override for the legacy render. |
+| `include_video`    | No       | Text      | `false` | Set to `true` to request a rendered MP4 animation. |
 
 > **Tip:** When `mode=legacy` the fast render still runs under the hood, but the
 > service only streams the legacy PNG back. `mode=both` returns a `.zip`
@@ -69,6 +70,9 @@ handled by FastAPI—invalid values return HTTP 422.
 - `mode=legacy` → Response is `image/png` containing the legacy render.
 - `mode=both` → Response is `application/zip` with `*_fast.png` and
   `*_legacy.png` entries.
+- Adding `include_video=true` returns an `application/zip` bundle containing
+  the requested still(s) plus `*_video.mp4`. The service also stores each asset
+  (PNG/MP4/ZIP) individually inside `processed_files/` for auditing.
 
 Common response headers:
 
@@ -79,6 +83,10 @@ Common response headers:
 - `X-Fast-Output-Backup` – Relative path to the fast PNG backup (if produced).
 - `X-Legacy-Output-Backup` – Relative path to the legacy PNG backup (if
   produced).
+- `X-Video-Output-Backup` – Relative path to the MP4 backup when `include_video`
+  is enabled.
+- `X-Archive-Backup` – Relative path to the ZIP bundle stored for reference
+  when a ZIP response is returned.
 
 Every upload persists to disk alongside the renders (deduplicated with a
 timestamp suffix) so you can re-download the originals later.
@@ -104,6 +112,13 @@ curl -F "file=@input_PES/cat.PES" \
      -F "mode=both" \
      http://SERVER_IP:8000/render \
      --output cat_outputs.zip
+
+# Fast render plus video bundle
+curl -F "file=@input_PES/cat.PES" \
+     -F "mode=fast" \
+     -F "include_video=true" \
+     http://SERVER_IP:8000/render \
+     --output cat_fast_with_video.zip
 ```
 
 To customise sampling:
@@ -136,6 +151,9 @@ with open("cat_fast.png", "wb") as out_file:
 print("Render mode:", response.headers.get("X-Mode"))
 print("Render time:", response.headers.get("X-Render-Time", "n/a"), "seconds")
 print("Input backup:", response.headers.get("X-Input-Backup"))
+print("Video backup:", response.headers.get("X-Video-Output-Backup"))
+print("Video render time:", response.headers.get("X-Video-Render-Time"))
+print("Archive backup:", response.headers.get("X-Archive-Backup"))
 ```
 
 ### Additional Endpoints

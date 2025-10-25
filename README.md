@@ -90,10 +90,13 @@ uvicorn render_service:app --host 0.0.0.0 --port 8000
 - Choose `mode=fast`, `mode=legacy`, or `mode=both` to control which PNGs are
   returned. When both are requested the response is a `.zip` containing both
   renders.
+- Add `include_video=true` to request the animation MP4; the server bundles the
+  still(s) and the video into a ZIP download.
 - The service saves every uploaded PES plus the generated PNGs into
   `processed_files/` with timestamped names so you never lose an artefact.
 - Response headers (`X-Input-Backup`, `X-Fast-Output-Backup`,
-  `X-Legacy-Output-Backup`) record where each file was stored.
+  `X-Legacy-Output-Backup`, `X-Video-Output-Backup`, `X-Archive-Backup`)
+  record where each file was stored.
 
 ### Optional PES Analysis
 
@@ -119,7 +122,7 @@ Adjust parameters such as `thread_thickness`, `desired_dimension`, or material g
 
 - `output/`: Contains the final `.png` and `.mp4` files for each design. The MP4 is typically a flythrough or animated preview configured in the Blender scene.
 - `processing_log.csv`: Created by `batchrun.py` to record job metadata and success/failure states for traceability.
-- `processed_files/`: Stores backed-up PES uploads and rendered PNGs produced by the API along with `render_service.log` (Blender stdout/stderr).
+- `processed_files/`: Stores backed-up PES uploads, rendered PNGs, optional MP4 videos, and the ZIP bundles the API returns along with `render_service.log` (Blender stdout/stderr).
 - `pes_analysis/`: Stores optional diagnostic reports created by `analyze_pes.py`.
 
 ## Troubleshooting
