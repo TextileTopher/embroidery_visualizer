@@ -13,6 +13,8 @@ from os import path
 z_height = 0.0002
 scale = 10000.0
 section_lift = 0.00002
+MAX_THREAD_COLORS = 32
+DEFAULT_THREAD_COLOR = (0.8, 0.8, 0.8)
 
 NO_COMMAND = -1
 STITCH = 0
@@ -24,6 +26,8 @@ COLOR_CHANGE = 5
 NEEDLE_SET = 9
 
 show_jumpwires = True
+thread_colors = []
+thread_color_cap_applied = False
 
 
 def truncate(f, n):
@@ -35,6 +39,11 @@ def create_material():
     Base name of the material is ThreadMaterial, which Blender will append
     with a number if a material with this name already exists"""
 
+    global thread_color_cap_applied
+
+    colors = thread_colors if thread_colors else [DEFAULT_THREAD_COLOR]
+    color_count = len(colors)
+
     material = bpy.data.materials.new(name="ThreadMaterial")
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -43,19 +52,16 @@ def create_material():
     nodes.clear()  # Clear existing nodes
 
     # Nodes are created in the same order as how they are linked in the node editor
-    # Add an Attribute node; we store the thread number in an attribute which this node retreives
+    # Add an Attribute node; we store the thread number in an attribute which this node retrieves
     attribute_node = nodes.new(type="ShaderNodeAttribute")
     attribute_node.attribute_type = "OBJECT"
     attribute_node.attribute_name = "thread_index"
     attribute_node.location = (-900, 0)
 
     # Add a Math node; we will use this to divide the thread number by the number of thread colors to
-    # find it's position in the color ramp
+    # find its position in the color ramp
     math_node_divide = nodes.new(type="ShaderNodeMath")
     math_node_divide.operation = "DIVIDE"
-    math_node_divide.inputs[1].default_value = len(
-        thread_colors
-    )  # Set the multiplier value
     math_node_divide.location = (-700, 0)
 
     math_node_add = nodes.new(type="ShaderNodeMath")
@@ -66,17 +72,41 @@ def create_material():
     # Add a Color ramp node; this has a color for each of our threads
     color_ramp_node = nodes.new(type="ShaderNodeValToRGB")
     color_ramp_node.location = (-300, 0)
-    color_ramp_node.color_ramp.interpolation = "CONSTANT"
-    for index, color in enumerate(thread_colors):
-        # use truncate to avoid floating point errors
-        color_stop = color_ramp_node.color_ramp.elements.new(
-            truncate(1.0 / len(thread_colors) * index, 3)
-        )
-        color_stop.color = (color[0], color[1], color[2], 1.0)
+    color_ramp = color_ramp_node.color_ramp
+    color_ramp.interpolation = "CONSTANT"
 
-    # by default a color ramp has a black and white color at the start and end, remove these
-    color_ramp_node.color_ramp.elements.remove(color_ramp_node.color_ramp.elements[0])
-    color_ramp_node.color_ramp.elements.remove(color_ramp_node.color_ramp.elements[-1])
+    if not thread_color_cap_applied:
+        for index, color in enumerate(colors):
+            color_stop = color_ramp.elements.new(
+                truncate(1.0 / max(color_count, 1) * index, 3)
+            )
+            color_stop.color = (color[0], color[1], color[2], 1.0)
+
+        if len(color_ramp.elements) > 0:
+            color_ramp.elements.remove(color_ramp.elements[0])
+        if len(color_ramp.elements) > 0:
+            color_ramp.elements.remove(color_ramp.elements[-1])
+        math_node_divide.inputs[1].default_value = max(color_count, 1)
+    else:
+        while len(color_ramp.elements) > 1:
+            color_ramp.elements.remove(color_ramp.elements[-1])
+        color_ramp.elements[0].position = 0.0
+        color_ramp.elements[0].color = (
+            colors[0][0],
+            colors[0][1],
+            colors[0][2],
+            1.0,
+        )
+        for index in range(1, color_count):
+            position = truncate(index / max(color_count - 1, 1), 3)
+            new_element = color_ramp.elements.new(position)
+            new_element.color = (
+                colors[index][0],
+                colors[index][1],
+                colors[index][2],
+                1.0,
+            )
+        math_node_divide.inputs[1].default_value = max(color_count, 1)
 
     # Add a Principled BSDF node
     bsdf_node = nodes.new(type="ShaderNodeBsdfPrincipled")
@@ -214,10 +244,20 @@ def parse_embroidery_data(
         report_message = "Error reading file"
         report_type = "ERROR"
         return report_message, report_type
+    global thread_colors
+    global thread_color_cap_applied
+
+    declared_thread_count = len(pattern.threadlist)
+    thread_color_cap_applied = False
+    if declared_thread_count > MAX_THREAD_COLORS:
+        thread_color_cap_applied = True
+        print(
+            f"[Embroidery Importer] Warning: File declares {declared_thread_count} thread colors; "
+            f"limiting to first {MAX_THREAD_COLORS} for Blender material support."
+        )
 
     if do_create_material:
-        global thread_colors
-        thread_colors = [
+        raw_thread_colors = [
             [
                 thread.get_red() / 255.0,
                 thread.get_green() / 255.0,
@@ -225,10 +265,24 @@ def parse_embroidery_data(
             ]
             for thread in pattern.threadlist
         ]
+        if not raw_thread_colors:
+            thread_colors = [DEFAULT_THREAD_COLOR]
+        else:
+            thread_colors = raw_thread_colors[:MAX_THREAD_COLORS]
 
     thread_index = 0  # start at the first thread
     sections = []  # list of sections, each section is a list of stitches
-    section = {"thread_index": thread_index, "stitches": [], "is_jump": False}
+
+    def clamp_thread_index(index: int) -> int:
+        if MAX_THREAD_COLORS <= 0:
+            return index
+        if do_create_material:
+            if not thread_colors:
+                return 0
+            return min(index, len(thread_colors) - 1)
+        return min(index, MAX_THREAD_COLORS - 1)
+
+    section = {"thread_index": clamp_thread_index(thread_index), "stitches": [], "is_jump": False}
 
     for stitch in pattern.stitches:
         x = float(stitch[0]) / scale
@@ -248,29 +302,41 @@ def parse_embroidery_data(
                     # close the section and start a new one
                     sections.append(section)
                     section = {
-                        "thread_index": thread_index,
+                        "thread_index": clamp_thread_index(thread_index),
                         "stitches": [],
                     }
 
         elif c == COLOR_CHANGE:  # color change, move to the next thread
             sections.append(section)  # end our previous section
             thread_index += 1
-            section = {"thread_index": thread_index, "stitches": []}
+            section = {
+                "thread_index": clamp_thread_index(thread_index),
+                "stitches": [],
+            }
 
         elif (
             c == TRIM
         ):  # trim moves to the next section without a line between the old and new position
             sections.append(section)  # end our previous section
-            section = {"thread_index": thread_index, "stitches": []}
+            section = {
+                "thread_index": clamp_thread_index(thread_index),
+                "stitches": [],
+            }
 
         elif c == END:  # end of a section?
             sections.append(section)
-            section = {"thread_index": thread_index, "stitches": []}
+            section = {
+                "thread_index": clamp_thread_index(thread_index),
+                "stitches": [],
+            }
 
         else:  # unhandled/unknown commands
             print("[Embroidery Importer] Unknown command: ", c)
             sections.append(section)  # end our previous section
-            section = {"thread_index": thread_index, "stitches": []}
+            section = {
+                "thread_index": clamp_thread_index(thread_index),
+                "stitches": [],
+            }
             section["stitches"].append([x, y])
 
     if do_create_material:
@@ -320,8 +386,10 @@ def parse_embroidery_data(
         # If we created a collection, move the new curve into it
         if collection:
             # Unlink from current and link to our new collection
-            bpy.context.scene.collection.objects.unlink(curve_obj)
-            collection.objects.link(curve_obj)
+            if curve_obj.name in bpy.context.scene.collection.objects:
+                bpy.context.scene.collection.objects.unlink(curve_obj)
+            if curve_obj.name not in collection.objects:
+                collection.objects.link(curve_obj)
 
         curve_obj.data = curve_data
 

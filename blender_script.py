@@ -6,13 +6,35 @@ from mathutils import Vector
 from mathutils import Matrix
 
 # Locate the importer code file
-addon_file = "/opt/blender/4.3/scripts/addons/ImporterScript/__init__.py"
+script_dir = os.path.dirname(__file__)
+local_addon_file = os.path.join(script_dir, "ImporterScript", "__init__.py")
+addon_file = (
+    local_addon_file
+    if os.path.exists(local_addon_file)
+    else "/opt/blender/4.3/scripts/addons/ImporterScript/__init__.py"
+)
 
-# Read and execute the code in __init__.py
 with open(addon_file, 'r', encoding='utf-8') as f:
-    code = f.read()
+    addon_code = compile(f.read(), addon_file, "exec")
 
-exec(code, globals(), globals())  # This will define the operator and register function
+exec(addon_code, globals(), globals())
+print(f"[Embroidery Visualizer] Using importer from {addon_file}")
+
+if hasattr(bpy.types, "ImportEmbroideryData"):
+    try:
+        bpy.utils.unregister_class(bpy.types.ImportEmbroideryData)
+    except Exception as exc:
+        print(f"[Embroidery Visualizer] Warning: failed to unregister prior ImportEmbroideryData: {exc}")
+
+try:
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+except Exception:
+    pass
+
+if "register" in globals():
+    register()
+else:
+    raise RuntimeError("ImporterScript register() not available after exec")
 
 # Blender adds its own arguments before ours, so we find '--' and slice from there.
 if "--" in sys.argv:

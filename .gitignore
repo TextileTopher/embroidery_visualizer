@@ -26,6 +26,9 @@ processing_log.csv
 output/
 output2/
 input_PES_finished/
+processed_files/
+pes_analysis/
+logs/
 
 # --- IDE/system ---
 .DS_Store
