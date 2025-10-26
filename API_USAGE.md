@@ -16,6 +16,15 @@ renders.
   ```
 - The Blender-side importer (`ImporterScript`) already configured for your
   environment.
+- DigitalOcean Spaces credentials stored in `embroidery_visualizer/.env`:
+  ```
+  SPACES_ENDPOINT=https://sfo3.digitaloceanspaces.com
+  SPACES_REGION=sfo3
+  SPACES_ACCESS_KEY=your_access_key
+  SPACES_SECRET_KEY=your_secret_key
+  ```
+  `render_service.py` automatically loads `.env` (and `.venv/.env` when present)
+  at startup, so Uvicorn can be launched without exporting variables manually.
 
 ### Recommended Environment Setup
 
@@ -39,6 +48,82 @@ uvicorn render_service:app --host 0.0.0.0 --port 8000
 - `--host 0.0.0.0` allows machines on your local network to reach the service.
 - Blender runs headlessly per request, so no long-lived Blender daemon needs to
   be managed.
+
+### JSON Workflow (DigitalOcean Spaces)
+
+`POST /render-from-space` downloads a PES file from DigitalOcean Spaces,
+executes the requested renders, and uploads the outputs back to Spaces.
+
+```json
+{
+  "input": {
+    "bucket_name": "digitizer",
+    "file_path": "test",
+    "file_name": "shark_colored.pes"
+  },
+  "operations": {
+    "generate_low": true,
+    "generate_high": false,
+    "generate_video": false
+  },
+  "output": {
+    "bucket_name": "digitizer",
+    "base_path": "test"
+  },
+  "render_options": {
+    "resolution": 1024,
+    "legacy_resolution": 2048,
+    "fast_samples": 128,
+    "legacy_samples": 512,
+    "camera": "TopView",
+    "thread_thickness": 0.2
+  }
+}
+```
+
+- `input.bucket_name`, `input.file_name`, and `output.bucket_name` are required.
+- `file_path` and `base_path` are optional; defaults place outputs alongside the
+  input asset.
+- `file_name` must end with `.pes` (case-insensitive).
+- At least one of `generate_low` or `generate_high` must be `true`.
+- Objects larger than 50 MB are rejected with HTTP 413 (size checked via
+  `head_object` before download).
+- Outputs upload immediately after each render finishes. If a key exists, the
+  service appends a UTC timestamp suffix before the extension; if a unique name
+  still cannot be produced, the call fails with HTTP 409.
+
+Response payload:
+
+```json
+{
+  "job_id": "uuid",
+  "input": {
+    "bucket_name": "digitizer",
+    "object_key": "test/shark_colored.pes",
+    "size_bytes": 229134
+  },
+  "outputs": {
+    "bucket_name": "digitizer",
+    "base_path": "test",
+    "fast_png": {
+      "object_key": "test/shark_colored_fast.png",
+      "size_bytes": 4202718
+    }
+  },
+  "metrics": {
+    "render_time_seconds_total": 13.0,
+    "stages": {
+      "fast_png_seconds": 12.5
+    }
+  },
+  "errors": []
+}
+```
+
+- Only successful assets appear under `outputs`; failures are described in the
+  `errors` array (e.g. `"video_upload: AccessDenied"`).
+- `metrics.stages` includes per-render timing when available.
+- `job_id` is logged with every line in `processed_files/render_service.log`.
 
 ### Request Workflow
 

@@ -4,9 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 *.egg-info/
-.env
-.venv/
-venv/
+*.env
+*.venv/
+*venv/
 *.log
 
 # --- Blender ---

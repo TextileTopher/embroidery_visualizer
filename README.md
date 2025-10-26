@@ -80,23 +80,73 @@ python3 render_still.py \
 ### Serve the Render API
 
 `render_service.py` exposes the still rendering pipeline over HTTP so teammates
-can request images remotely. Launch it with Uvicorn from the repository root:
+can request images remotely. Two endpoints are available:
+
+- `POST /render` (multipart upload) — existing workflow for uploading a PES file.
+- `POST /render-from-space` (JSON) — fetches the PES file and writes results
+  directly to DigitalOcean Spaces via the S3 API.
+
+#### Environment Configuration
+
+The service automatically loads DigitalOcean credentials from the repository
+root `.env` file and, for backwards compatibility, from `.venv/.env` if present.
+Create `embroidery_visualizer/.env` with:
+
+```
+SPACES_ENDPOINT=https://sfo3.digitaloceanspaces.com
+SPACES_REGION=sfo3
+SPACES_ACCESS_KEY=your_access_key
+SPACES_SECRET_KEY=your_secret_key
+```
+
+> Use the regional endpoint (`https://sfo3.digitaloceanspaces.com`). Bucket or
+> CDN endpoints (e.g. `https://digitizer.sfo3.digitaloceanspaces.com`) will
+> cause S3 API calls to fail.
+
+Activate the virtual environment and start Uvicorn from the repository root:
 
 ```bash
+cd ~/embroidery_visualizer
+source .venv/bin/activate
 uvicorn render_service:app --host 0.0.0.0 --port 8000
 ```
 
-- Upload a PES file via `POST /render` (see `API_USAGE.md` for field details).
-- Choose `mode=fast`, `mode=legacy`, or `mode=both` to control which PNGs are
-  returned. When both are requested the response is a `.zip` containing both
-  renders.
-- Add `include_video=true` to request the animation MP4; the server bundles the
-  still(s) and the video into a ZIP download.
-- The service saves every uploaded PES plus the generated PNGs into
-  `processed_files/` with timestamped names so you never lose an artefact.
-- Response headers (`X-Input-Backup`, `X-Fast-Output-Backup`,
-  `X-Legacy-Output-Backup`, `X-Video-Output-Backup`, `X-Archive-Backup`)
-  record where each file was stored.
+The server backs up inputs and outputs to `processed_files/` and logs each job
+to `processed_files/render_service.log`.
+
+#### Spaces JSON Endpoint (client example)
+
+```bash
+curl -X POST 'http://SERVER_IP:8000/render-from-space' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "input": {
+          "bucket_name": "digitizer",
+          "file_path": "test",
+          "file_name": "shark_colored.pes"
+        },
+        "operations": {
+          "generate_low": true,
+          "generate_high": false,
+          "generate_video": false
+        },
+        "output": {},
+        "render_options": {
+          "resolution": 1024,
+          "fast_samples": 128
+        }
+      }'
+```
+
+- `output.bucket_name` defaults to the input bucket, and `output.base_path`
+  defaults to the input `file_path`, so renders land alongside the source file.
+- If an output object already exists, the uploader appends a UTC timestamp
+  suffix before the extension (e.g. `design_fast_2025-10-26T02-12-45Z.png`).
+- The JSON response mirrors the request, listing the final object keys and file
+  sizes for each successful asset plus per-stage timing metrics.
+
+See `API_USAGE.md` for detailed field descriptions, response schemas, and the
+legacy multipart workflow.
 
 ### Optional PES Analysis
 
