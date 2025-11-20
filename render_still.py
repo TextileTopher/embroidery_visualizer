@@ -4,6 +4,8 @@ import subprocess
 import sys
 import time
 
+from apply_texture_background import apply_texture_overlay, resolve_path as resolve_texture_path
+
 # Path to Blender executable (adjust if your installation lives elsewhere).
 BLENDER_BINARY = "/opt/blender/blender"
 
@@ -56,6 +58,12 @@ def parse_args():
         help="Optional second output PNG for a high-quality comparison render.",
     )
     parser.add_argument(
+        "--high_quality_output",
+        dest="legacy_output",
+        default=None,
+        help="Alias for --legacy_output (preferred).",
+    )
+    parser.add_argument(
         "--legacy_resolution",
         type=int,
         default=None,
@@ -67,7 +75,49 @@ def parse_args():
         default=None,
         help="Optional Cycles sample override for the legacy render.",
     )
+    parser.add_argument(
+        "--fabric_texture",
+        default="assets/textures/canvas1.png",
+        help="Texture to replace the white background (set to 'none' to skip).",
+    )
+    parser.add_argument(
+        "--fabric_tolerance",
+        type=int,
+        default=8,
+        help="How close to pure white a pixel must be before it is replaced.",
+    )
     return parser.parse_args()
+
+
+def resolve_existing_output(repo_dir, user_path, fallback_folder="output"):
+    if os.path.isabs(user_path):
+        return os.path.abspath(user_path)
+
+    candidate = os.path.join(repo_dir, user_path)
+    if os.path.exists(candidate):
+        return os.path.abspath(candidate)
+
+    fallback = os.path.join(repo_dir, fallback_folder, user_path)
+    if os.path.exists(fallback):
+        return os.path.abspath(fallback)
+
+    # File might not exist yet; prefer folder under fallback.
+    return os.path.abspath(fallback)
+
+
+def maybe_apply_texture(repo_dir, image_path, texture_arg, tolerance):
+    if not texture_arg or texture_arg.lower() == "none":
+        return
+
+    texture_path = resolve_texture_path(repo_dir, texture_arg, "assets/textures")
+    print(f"Applying fabric texture {texture_path} to {image_path}")
+    apply_texture_overlay(
+        render_path=image_path,
+        texture_path=texture_path,
+        output_path=image_path,
+        tolerance=tolerance,
+    )
+    print(f"Updated textured output: {image_path}")
 
 
 def main():
@@ -110,6 +160,13 @@ def main():
     subprocess.run(cmd, check=True)
     total_elapsed = time.perf_counter() - start_time
     print(f"Blender exited successfully in {total_elapsed:.2f} seconds.")
+
+    output_abs = resolve_existing_output(repo_dir, args.output_image)
+    maybe_apply_texture(repo_dir, output_abs, args.fabric_texture, args.fabric_tolerance)
+
+    if args.legacy_output:
+        legacy_output_abs = resolve_existing_output(repo_dir, args.legacy_output)
+        maybe_apply_texture(repo_dir, legacy_output_abs, args.fabric_texture, args.fabric_tolerance)
 
 
 if __name__ == "__main__":

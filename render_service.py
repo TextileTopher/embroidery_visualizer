@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from PIL import Image
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 try:
@@ -25,14 +27,36 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
 
-if load_dotenv:
-    load_dotenv(dotenv_path=os.path.join(repo_dir, ".env"))
-    load_dotenv(dotenv_path=os.path.join(repo_dir, ".venv", ".env"))
+def _load_env_file(path: str, *, override: bool) -> None:
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                if not key:
+                    continue
+                if override or key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+from apply_texture_background import apply_texture_overlay, replace_white_with_texture
 
 BLENDER_BINARY = "/opt/blender/blender"
 DEFAULT_RESOLUTION = 1024
 DEFAULT_CAMERA = "TopView"
 DEFAULT_THREAD_THICKNESS = 0.2
+DEFAULT_LOW_QUALITY_RESOLUTION = 768
+DEFAULT_HIGH_QUALITY_RESOLUTION = 2048
+DEFAULT_LOW_QUALITY_SAMPLES = 64
+DEFAULT_HIGH_QUALITY_SAMPLES = 512
 
 repo_dir = os.path.dirname(os.path.abspath(__file__))
 blend_file = os.path.join(repo_dir, "BlenderSetup.blend")
@@ -40,6 +64,31 @@ blender_still_script = os.path.join(repo_dir, "blender_render_still.py")
 blender_video_script = os.path.join(repo_dir, "blender_script.py")
 processed_dir = os.path.join(repo_dir, "processed_files")
 service_log = os.path.join(processed_dir, "render_service.log")
+textures_dir = os.path.join(repo_dir, "assets", "textures")
+TEXTURE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+DEFAULT_BACKGROUND_TOLERANCE = 8
+CANVAS_TEXTURE_FILE = os.path.join(textures_dir, "canvas1.png")
+
+env_path = os.path.join(repo_dir, ".env")
+venv_env_path = os.path.join(repo_dir, ".venv", ".env")
+if load_dotenv:
+    load_dotenv(dotenv_path=venv_env_path, override=False)
+    load_dotenv(dotenv_path=env_path, override=True)
+
+_load_env_file(venv_env_path, override=False)
+_load_env_file(env_path, override=True)
+
+# Allow AWS_* env names to populate (and override) SPACES_* variables.
+ENV_FALLBACKS = {
+    "SPACES_ENDPOINT": "AWS_S3_ENDPOINT_URL",
+    "SPACES_ACCESS_KEY": "AWS_ACCESS_KEY_ID",
+    "SPACES_SECRET_KEY": "AWS_SECRET_ACCESS_KEY",
+    "SPACES_REGION": "AWS_REGION",
+}
+for target, source in ENV_FALLBACKS.items():
+    value = os.getenv(source)
+    if value:
+        os.environ[target] = value
 
 if not os.path.exists(BLENDER_BINARY):
     raise RuntimeError(f"Blender binary not found at {BLENDER_BINARY}")
@@ -257,6 +306,77 @@ def _safe_backup_prefix(filename: str) -> str:
     return candidate or "upload"
 
 
+def _normalize_framing(value: Optional[str]) -> str:
+    if not value:
+        return "full"
+    value = value.strip().lower()
+    if value not in {"full", "zoomed"}:
+        return "full"
+    return value
+
+
+def _list_available_textures() -> List[str]:
+    if not os.path.isdir(textures_dir):
+        return []
+    files = []
+    for entry in os.listdir(textures_dir):
+        path = os.path.join(textures_dir, entry)
+        if os.path.isfile(path) and os.path.splitext(entry)[1].lower() in TEXTURE_EXTENSIONS:
+            files.append(entry)
+    return sorted(files)
+
+
+def _resolve_texture_file(name: str) -> Optional[str]:
+    if os.path.isabs(name):
+        return name if os.path.exists(name) else None
+    candidate = os.path.join(textures_dir, name)
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def _apply_solid_background(image_path: str, color: Tuple[int, int, int], tolerance: int) -> None:
+    with Image.open(image_path) as render:
+        color_tile = Image.new("RGB", (8, 8), color)
+        composited = replace_white_with_texture(render, color_tile, tolerance)
+        composited.save(image_path)
+
+
+def apply_background_choice(image_path: str, choice: Optional[str], tolerance: Optional[int]) -> Optional[str]:
+    if not choice:
+        return "white"
+    normalized = choice.strip().lower()
+    if not normalized or normalized == "white":
+        return "white"
+
+    tolerance = tolerance if tolerance is not None else DEFAULT_BACKGROUND_TOLERANCE
+
+    if normalized == "black":
+        _apply_solid_background(image_path, (0, 0, 0), tolerance)
+        return "black"
+
+    if normalized == "random":
+        textures = _list_available_textures()
+        if not textures:
+            logger.warning("No textures found in %s; keeping white background.", textures_dir)
+            return "white"
+        selection = random.choice(textures)
+        texture_path = _resolve_texture_file(selection)
+        if not texture_path:
+            logger.warning("Randomly selected texture %s missing; keeping white background.", selection)
+            return "white"
+        apply_texture_overlay(image_path, texture_path, image_path, tolerance=tolerance)
+        return selection
+
+    texture_path = _resolve_texture_file(choice)
+    if not texture_path:
+        logger.warning("Texture '%s' not found; keeping white background.", choice)
+        return "white"
+
+    apply_texture_overlay(image_path, texture_path, image_path, tolerance=tolerance)
+    return os.path.basename(texture_path)
+
+
 def run_blender_render(
     input_path: str,
     fast_output_path: str,
@@ -309,7 +429,14 @@ def run_blender_render(
     return time.perf_counter() - start
 
 
-def run_blender_video(input_path: str, temp_image_path: str, output_video_path: str) -> float:
+def run_blender_video(
+    input_path: str,
+    temp_image_path: str,
+    output_video_path: str,
+    *,
+    video_quality: Optional[str] = None,
+    video_framing: Optional[str] = None,
+) -> float:
     cmd = [
         BLENDER_BINARY,
         "-b",
@@ -324,6 +451,10 @@ def run_blender_video(input_path: str, temp_image_path: str, output_video_path: 
         "-v",
         output_video_path,
     ]
+    if video_quality:
+        cmd.extend(["--video_quality", video_quality])
+    if video_framing:
+        cmd.extend(["--video_framing", video_framing])
     logger.info("Running Blender (video): %s", " ".join(cmd))
     start = time.perf_counter()
     try:
@@ -371,31 +502,47 @@ class SpacesOutputSpec(BaseModel):
 
 
 class OperationFlags(BaseModel):
-    generate_low: bool = False
-    generate_high: bool = False
-    generate_video: bool = False
+    image_generate_low: bool = False
+    image_generate_high: bool = False
+    video_generate_low: bool = False
+    video_generate_high: bool = False
+    video_generate_ultra_high: bool = False
+    generate_low: bool = Field(default=False, description="Legacy alias for image_generate_low")
+    generate_high: bool = Field(default=False, description="Legacy alias for image_generate_high")
+    generate_video: bool = Field(default=False, description="Legacy alias for video_generate_*")
 
     @model_validator(mode="after")
     def _ensure_primary_render(self):
-        if not (self.generate_low or self.generate_high):
+        if not (self.image_generate_low or self.generate_low or self.image_generate_high or self.generate_high):
             raise ValueError("At least one of generate_low or generate_high must be true.")
         return self
 
 
-class RenderOptions(BaseModel):
+class ImageRenderOptions(BaseModel):
     resolution: Optional[int] = Field(default=None, gt=0)
     legacy_resolution: Optional[int] = Field(default=None, gt=0)
     fast_samples: Optional[int] = Field(default=None, gt=0)
     legacy_samples: Optional[int] = Field(default=None, gt=0)
+    low_quality_resolution: Optional[int] = Field(default=None, gt=0)
+    high_quality_resolution: Optional[int] = Field(default=None, gt=0)
+    low_quality_samples: Optional[int] = Field(default=None, gt=0)
+    high_quality_samples: Optional[int] = Field(default=None, gt=0)
     camera: Optional[str] = Field(default=None, min_length=1)
     thread_thickness: Optional[float] = Field(default=None, gt=0)
+    background: Optional[str] = Field(default=None, description="Background selection (white, black, texture filename, or random)")
+    background_tolerance: Optional[int] = Field(default=None, gt=0)
+
+
+# Backwards compatibility alias
+RenderOptions = ImageRenderOptions
 
 
 class RenderFromSpaceRequest(BaseModel):
     input: SpacesInputSpec
     operations: OperationFlags
     output: SpacesOutputSpec
-    render_options: Optional[RenderOptions] = None
+    render_options: Optional[RenderOptions] = None  # legacy alias for image_render_options
+    image_render_options: Optional[ImageRenderOptions] = None
     debug: bool = False
 
 
@@ -413,15 +560,23 @@ class AssetSummary(BaseModel):
 class OutputSummary(BaseModel):
     bucket_name: str
     base_path: str
-    fast_png: Optional[AssetSummary] = None
-    legacy_png: Optional[AssetSummary] = None
-    video_mp4: Optional[AssetSummary] = None
+    low_quality_png: Optional[AssetSummary] = None
+    low_quality_canvas_png: Optional[AssetSummary] = None
+    high_quality_png: Optional[AssetSummary] = None
+    high_quality_canvas_png: Optional[AssetSummary] = None
+    video_low_mp4: Optional[AssetSummary] = None
+    video_high_mp4: Optional[AssetSummary] = None
+    video_ultra_mp4: Optional[AssetSummary] = None
+    video_mp4: Optional[AssetSummary] = None  # legacy field
 
 
 class StageMetrics(BaseModel):
-    fast_png_seconds: Optional[float] = None
-    legacy_png_seconds: Optional[float] = None
-    video_seconds: Optional[float] = None
+    low_quality_png_seconds: Optional[float] = None
+    high_quality_png_seconds: Optional[float] = None
+    video_low_seconds: Optional[float] = None
+    video_high_seconds: Optional[float] = None
+    video_ultra_seconds: Optional[float] = None
+    video_seconds: Optional[float] = None  # legacy aggregate
 
 
 class RenderMetrics(BaseModel):
@@ -457,6 +612,22 @@ def _read_log_tail(lines: int = 60) -> Optional[str]:
         return None
 
 
+def _generate_canvas_overlay(src: Path, dest: Path, tolerance: int) -> Optional[Path]:
+    if not os.path.exists(CANVAS_TEXTURE_FILE):
+        return None
+    try:
+        apply_texture_overlay(
+            render_path=str(src),
+            texture_path=CANVAS_TEXTURE_FILE,
+            output_path=str(dest),
+            tolerance=tolerance,
+        )
+        return dest
+    except Exception as exc:
+        logger.warning("Failed to create canvas overlay for %s: %s", src, exc)
+        return None
+
+
 def _build_completion_message(
     request_model: "RenderFromSpaceRequest",
     *,
@@ -476,17 +647,17 @@ def _build_completion_message(
     ]
 
     asset_labels = {
-        "fast_png": "Fast PNG",
-        "legacy_png": "Legacy PNG",
-        "video_mp4": "Video MP4",
-    }
-    stage_lookup = {
-        "fast_png": stage_metrics.fast_png_seconds,
-        "legacy_png": stage_metrics.legacy_png_seconds,
-        "video_mp4": stage_metrics.video_seconds,
+        "low_quality_png": ("Low-quality PNG", stage_metrics.low_quality_png_seconds),
+        "low_quality_canvas_png": ("Low-quality Canvas PNG", stage_metrics.low_quality_png_seconds),
+        "high_quality_png": ("High-quality PNG", stage_metrics.high_quality_png_seconds),
+        "high_quality_canvas_png": ("High-quality Canvas PNG", stage_metrics.high_quality_png_seconds),
+        "video_low_mp4": ("Low-quality MP4", stage_metrics.video_low_seconds),
+        "video_high_mp4": ("High-quality MP4", stage_metrics.video_high_seconds),
+        "video_ultra_mp4": ("Ultra-high-quality MP4", stage_metrics.video_ultra_seconds),
+        "video_mp4": ("Video MP4", stage_metrics.video_seconds),
     }
 
-    for key, label in asset_labels.items():
+    for key, (label, elapsed) in asset_labels.items():
         asset = uploaded_assets.get(key)
         if not asset:
             continue
@@ -495,7 +666,7 @@ def _build_completion_message(
                 f"{label} return file name: {Path(asset.object_key).name}",
                 f"{label} return file location: {asset.object_key}",
                 f"{label} return bucket: {output_bucket}",
-                f"{label} processing time: {_format_duration(stage_lookup.get(key))}",
+                f"{label} processing time: {_format_duration(elapsed)}",
             ]
         )
 
@@ -580,8 +751,8 @@ async def render_from_space(payload: Dict[str, Any]):
         )
 
     input_backup_path: Optional[Path] = None
-    fast_backup_path: Optional[Path] = None
-    legacy_backup_path: Optional[Path] = None
+    low_quality_backup_path: Optional[Path] = None
+    high_quality_backup_path: Optional[Path] = None
     video_backup_path: Optional[Path] = None
 
     overall_start = time.perf_counter()
@@ -591,10 +762,32 @@ async def render_from_space(payload: Dict[str, Any]):
     safe_base_prefix = _safe_backup_prefix(request_model.input.file_name)
     timestamp_suffix = int(time.time())
 
-    fast_requested = request_model.operations.generate_low
-    legacy_requested = request_model.operations.generate_high
-    video_requested = request_model.operations.generate_video
-    options = request_model.render_options or RenderOptions()
+    fast_requested = request_model.operations.image_generate_low or request_model.operations.generate_low
+    legacy_requested = request_model.operations.image_generate_high or request_model.operations.generate_high
+    image_options = (
+        request_model.image_render_options
+        or request_model.render_options
+        or ImageRenderOptions()
+    )
+    canvas_tolerance = image_options.background_tolerance or DEFAULT_BACKGROUND_TOLERANCE
+    default_video_quality = "high"
+    default_video_framing = _normalize_framing("full")
+    video_low_framing = default_video_framing
+    video_high_framing = default_video_framing
+    video_ultra_framing = default_video_framing
+    video_low_requested = request_model.operations.video_generate_low
+    video_high_requested = request_model.operations.video_generate_high
+    video_ultra_requested = getattr(request_model.operations, "video_generate_ultra_high", False)
+    if request_model.operations.generate_video and not (
+        video_low_requested or video_high_requested or video_ultra_requested
+    ):
+        if default_video_quality in {"fast", "low"}:
+            video_low_requested = True
+        elif default_video_quality == "ultra":
+            video_ultra_requested = True
+        else:
+            video_high_requested = True
+    video_requested = video_low_requested or video_high_requested or video_ultra_requested
 
     try:
         with tempfile.TemporaryDirectory(prefix=f"render_{job_id}_") as tmpdir:
@@ -625,24 +818,73 @@ async def render_from_space(payload: Dict[str, Any]):
             shutil.copyfile(local_input_path, input_backup_path)
             logger.info("job %s: backed up input to %s", job_id, input_backup_path)
 
-            fast_output_path = tmp_path / "fast.png"
-            legacy_output_path = tmp_path / "legacy.png" if legacy_requested else None
-            video_frame_path = tmp_path / "video_frame.png" if video_requested else None
-            video_output_path = tmp_path / "render.mp4" if video_requested else None
+            low_output_path = tmp_path / "low_quality.png"
+            high_output_path = tmp_path / "high_quality.png" if legacy_requested else None
+            video_jobs: List[Tuple[str, str, Path, Path, str]] = []
+            if video_low_requested:
+                video_jobs.append(
+                    (
+                        "fast",
+                        video_low_framing,
+                        tmp_path / "video_fast_frame.png",
+                        tmp_path / "video_fast.mp4",
+                        "low-quality",
+                    )
+                )
+            if video_high_requested:
+                video_jobs.append(
+                    (
+                        "high",
+                        video_high_framing,
+                        tmp_path / "video_high_frame.png",
+                        tmp_path / "video_high.mp4",
+                        "high-quality",
+                    )
+                )
+            if video_ultra_requested:
+                video_jobs.append(
+                    (
+                        "ultra",
+                        video_ultra_framing,
+                        tmp_path / "video_ultra_frame.png",
+                        tmp_path / "video_ultra.mp4",
+                        "ultra-high-quality",
+                    )
+                )
 
             still_render_elapsed = None
             if fast_requested or legacy_requested:
+                low_resolution = (
+                    image_options.low_quality_resolution
+                    or image_options.resolution
+                    or DEFAULT_LOW_QUALITY_RESOLUTION
+                )
+                high_resolution = (
+                    image_options.high_quality_resolution
+                    or image_options.legacy_resolution
+                    or DEFAULT_HIGH_QUALITY_RESOLUTION
+                )
+                low_samples = (
+                    image_options.low_quality_samples
+                    or image_options.fast_samples
+                    or DEFAULT_LOW_QUALITY_SAMPLES
+                )
+                high_samples = (
+                    image_options.high_quality_samples
+                    or image_options.legacy_samples
+                    or DEFAULT_HIGH_QUALITY_SAMPLES
+                )
                 try:
                     still_render_elapsed = run_blender_render(
                         str(local_input_path),
-                        str(fast_output_path),
-                        resolution=options.resolution or DEFAULT_RESOLUTION,
-                        camera=options.camera or DEFAULT_CAMERA,
-                        thread_thickness=options.thread_thickness or DEFAULT_THREAD_THICKNESS,
-                        fast_samples=options.fast_samples,
-                        legacy_output_path=str(legacy_output_path) if legacy_output_path else None,
-                        legacy_resolution=options.legacy_resolution,
-                        legacy_samples=options.legacy_samples,
+                        str(low_output_path),
+                        resolution=low_resolution,
+                        camera=image_options.camera or DEFAULT_CAMERA,
+                        thread_thickness=image_options.thread_thickness or DEFAULT_THREAD_THICKNESS,
+                        fast_samples=low_samples,
+                        legacy_output_path=str(high_output_path) if high_output_path else None,
+                        legacy_resolution=high_resolution if legacy_requested else None,
+                        legacy_samples=high_samples if legacy_requested else None,
                     )
                     logger.info("job %s: still render completed in %.2fs", job_id, still_render_elapsed)
                 except RuntimeError as exc:
@@ -650,128 +892,290 @@ async def render_from_space(payload: Dict[str, Any]):
                     errors.append(f"still_render: {exc}")
                 else:
                     if fast_requested:
-                        stage_metrics["fast_png_seconds"] = still_render_elapsed
+                        stage_metrics["low_quality_png_seconds"] = still_render_elapsed
                     if legacy_requested:
-                        stage_metrics["legacy_png_seconds"] = still_render_elapsed
+                        stage_metrics["high_quality_png_seconds"] = still_render_elapsed
+
+                    background_choice = image_options.background or "white"
+                    if fast_requested and low_output_path.exists():
+                        applied = apply_background_choice(
+                            str(low_output_path),
+                            background_choice,
+                            image_options.background_tolerance,
+                        )
+                        logger.info("job %s: applied background '%s' to low-quality render", job_id, applied)
+                    if legacy_requested and high_output_path and high_output_path.exists():
+                        applied = apply_background_choice(
+                            str(high_output_path),
+                            background_choice,
+                            image_options.background_tolerance,
+                        )
+                        logger.info("job %s: applied background '%s' to high-quality render", job_id, applied)
 
                     if fast_requested:
-                        if not fast_output_path.exists():
-                            errors.append("fast_render: output not produced")
+                        if not low_output_path.exists():
+                            errors.append("low_quality_render: output not produced")
                         else:
-                            fast_backup = Path(
+                            low_backup = Path(
                                 _dedupe_path(
-                                    os.path.join(processed_dir, f"{safe_base_prefix}_{timestamp_suffix}_fast.png")
+                                    os.path.join(
+                                        processed_dir, f"{safe_base_prefix}_{timestamp_suffix}_low_quality.png"
+                                    )
                                 )
                             )
-                            shutil.copyfile(fast_output_path, fast_backup)
-                            logger.info("job %s: backed up fast render to %s", job_id, fast_backup)
-                            fast_backup_path = fast_backup
-                            fast_filename = f"{safe_base_prefix}_fast.png"
-                            fast_key = compose_key(compose_base_path, fast_filename)
+                            shutil.copyfile(low_output_path, low_backup)
+                            logger.info("job %s: backed up low-quality render to %s", job_id, low_backup)
+                            low_quality_backup_path = low_backup
+                            low_filename = f"{safe_base_prefix}_low_quality.png"
+                            low_key = compose_key(compose_base_path, low_filename)
                             try:
                                 upload_result = upload_with_suffix_on_conflict(
-                                    output_bucket, fast_key, fast_output_path
+                                    output_bucket, low_key, low_output_path
                                 )
-                                uploaded_assets["fast_png"] = AssetSummary(
+                                uploaded_assets["low_quality_png"] = AssetSummary(
                                     object_key=upload_result["final_key"], size_bytes=upload_result["size_bytes"]
                                 )
+                                elapsed = stage_metrics.get("low_quality_png_seconds") or still_render_elapsed
+                                msg = (
+                                    f"[job {job_id}] low-quality PNG ready in {elapsed:.2f}s -> {upload_result['final_key']}"
+                                    if elapsed
+                                    else f"[job {job_id}] low-quality PNG uploaded -> {upload_result['final_key']}"
+                                )
+                                print(msg, flush=True)
+                                logger.info(msg)
                                 logger.info(
-                                    "job %s: uploaded fast output to %s/%s",
+                                    "job %s: uploaded low-quality output to %s/%s",
                                     job_id,
                                     output_bucket,
                                     upload_result["final_key"],
                                 )
                             except SpacesCollisionError as exc:
-                                logger.error("job %s: collision uploading fast render: %s", job_id, exc)
+                                logger.error("job %s: collision uploading low-quality render: %s", job_id, exc)
                                 raise HTTPException(
                                     status_code=409,
                                     detail={"job_id": job_id, "message": str(exc)},
                                 ) from exc
                             except ClientError as exc:
-                                logger.exception("job %s: failed to upload fast render", job_id)
-                                errors.append(f"fast_upload: {exc}")
+                                logger.exception("job %s: failed to upload low-quality render", job_id)
+                                errors.append(f"low_quality_upload: {exc}")
 
-                    if legacy_requested and legacy_output_path:
-                        if not legacy_output_path.exists():
-                            errors.append("legacy_render: output not produced")
+                            canvas_overlay_path = tmp_path / "low_quality_canvas.png"
+                            canvas_result = _generate_canvas_overlay(low_output_path, canvas_overlay_path, canvas_tolerance)
+                            if canvas_result and canvas_result.exists():
+                                try:
+                                    canvas_backup = Path(
+                                        _dedupe_path(
+                                            os.path.join(
+                                                processed_dir,
+                                                f"{safe_base_prefix}_{timestamp_suffix}_low_quality_canvas.png",
+                                            )
+                                        )
+                                    )
+                                    shutil.copyfile(canvas_result, canvas_backup)
+                                    canvas_filename = f"{safe_base_prefix}_low_quality_canvas.png"
+                                    canvas_key = compose_key(compose_base_path, canvas_filename)
+                                    upload_result = upload_with_suffix_on_conflict(
+                                        output_bucket, canvas_key, canvas_result
+                                    )
+                                    uploaded_assets["low_quality_canvas_png"] = AssetSummary(
+                                        object_key=upload_result["final_key"],
+                                        size_bytes=upload_result["size_bytes"],
+                                    )
+                                    logger.info(
+                                        "job %s: uploaded low-quality canvas output to %s/%s",
+                                        job_id,
+                                        output_bucket,
+                                        upload_result["final_key"],
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "job %s: failed to upload low-quality canvas overlay: %s",
+                                        job_id,
+                                        exc,
+                                    )
+
+                    if legacy_requested and high_output_path:
+                        if not high_output_path.exists():
+                            errors.append("high_quality_render: output not produced")
                         else:
-                            legacy_backup = Path(
+                            high_backup = Path(
                                 _dedupe_path(
-                                    os.path.join(processed_dir, f"{safe_base_prefix}_{timestamp_suffix}_legacy.png")
+                                    os.path.join(
+                                        processed_dir, f"{safe_base_prefix}_{timestamp_suffix}_high_quality.png"
+                                    )
                                 )
                             )
-                            shutil.copyfile(legacy_output_path, legacy_backup)
-                            logger.info("job %s: backed up legacy render to %s", job_id, legacy_backup)
-                            legacy_backup_path = legacy_backup
-                            legacy_filename = f"{safe_base_prefix}_legacy.png"
-                            legacy_key = compose_key(compose_base_path, legacy_filename)
+                            shutil.copyfile(high_output_path, high_backup)
+                            logger.info("job %s: backed up high-quality render to %s", job_id, high_backup)
+                            high_quality_backup_path = high_backup
+                            high_filename = f"{safe_base_prefix}_high_quality.png"
+                            high_key = compose_key(compose_base_path, high_filename)
                             try:
                                 upload_result = upload_with_suffix_on_conflict(
-                                    output_bucket, legacy_key, legacy_output_path
+                                    output_bucket, high_key, high_output_path
                                 )
-                                uploaded_assets["legacy_png"] = AssetSummary(
+                                uploaded_assets["high_quality_png"] = AssetSummary(
                                     object_key=upload_result["final_key"], size_bytes=upload_result["size_bytes"]
                                 )
+                                elapsed = stage_metrics.get("high_quality_png_seconds") or still_render_elapsed
+                                msg = (
+                                    f"[job {job_id}] high-quality PNG ready in {elapsed:.2f}s -> {upload_result['final_key']}"
+                                    if elapsed
+                                    else f"[job {job_id}] high-quality PNG uploaded -> {upload_result['final_key']}"
+                                )
+                                print(msg, flush=True)
+                                logger.info(msg)
                                 logger.info(
-                                    "job %s: uploaded legacy output to %s/%s",
+                                    "job %s: uploaded high-quality output to %s/%s",
                                     job_id,
                                     output_bucket,
                                     upload_result["final_key"],
                                 )
                             except SpacesCollisionError as exc:
-                                logger.error("job %s: collision uploading legacy render: %s", job_id, exc)
+                                logger.error("job %s: collision uploading high-quality render: %s", job_id, exc)
                                 raise HTTPException(
                                     status_code=409,
                                     detail={"job_id": job_id, "message": str(exc)},
                                 ) from exc
                             except ClientError as exc:
-                                logger.exception("job %s: failed to upload legacy render", job_id)
-                                errors.append(f"legacy_upload: {exc}")
+                                logger.exception("job %s: failed to upload high-quality render", job_id)
+                                errors.append(f"high_quality_upload: {exc}")
 
-            if video_requested and video_output_path and video_frame_path:
-                try:
-                    video_elapsed = run_blender_video(str(local_input_path), str(video_frame_path), str(video_output_path))
-                    stage_metrics["video_seconds"] = video_elapsed
-                    logger.info("job %s: video render completed in %.2fs", job_id, video_elapsed)
-                except RuntimeError as exc:
-                    logger.exception("job %s: video render failed", job_id)
-                    errors.append(f"video_render: {exc}")
-                else:
-                    if not video_output_path.exists():
-                        errors.append("video_render: output not produced")
-                    else:
-                        video_backup = Path(
-                            _dedupe_path(
-                                os.path.join(processed_dir, f"{safe_base_prefix}_{timestamp_suffix}_video.mp4")
+                        canvas_high_path = tmp_path / "high_quality_canvas.png"
+                        canvas_high_result = _generate_canvas_overlay(
+                            high_output_path, canvas_high_path, canvas_tolerance
+                        )
+                        if canvas_high_result and canvas_high_result.exists():
+                            try:
+                                canvas_high_backup = Path(
+                                    _dedupe_path(
+                                        os.path.join(
+                                            processed_dir,
+                                            f"{safe_base_prefix}_{timestamp_suffix}_high_quality_canvas.png",
+                                        )
+                                    )
+                                )
+                                shutil.copyfile(canvas_high_result, canvas_high_backup)
+                                canvas_high_filename = f"{safe_base_prefix}_high_quality_canvas.png"
+                                canvas_high_key = compose_key(compose_base_path, canvas_high_filename)
+                                upload_result = upload_with_suffix_on_conflict(
+                                    output_bucket, canvas_high_key, canvas_high_result
+                                )
+                                uploaded_assets["high_quality_canvas_png"] = AssetSummary(
+                                    object_key=upload_result["final_key"],
+                                    size_bytes=upload_result["size_bytes"],
+                                )
+                                logger.info(
+                                    "job %s: uploaded high-quality canvas output to %s/%s",
+                                    job_id,
+                                    output_bucket,
+                                    upload_result["final_key"],
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "job %s: failed to upload high-quality canvas overlay: %s",
+                                    job_id,
+                                    exc,
+                                )
+
+            if video_jobs:
+                total_video_jobs = len(video_jobs)
+                completed_video_jobs = 0
+                for quality, framing, frame_path, video_path, label in video_jobs:
+                    try:
+                        percent_complete = (completed_video_jobs / total_video_jobs) * 100
+                        print(
+                            f"[job {job_id}] Video progress: {percent_complete:.0f}% -> starting {label} ({framing})",
+                            flush=True,
+                        )
+                        video_elapsed = run_blender_video(
+                            str(local_input_path),
+                            str(frame_path),
+                            str(video_path),
+                            video_quality=quality,
+                            video_framing=framing,
+                        )
+                        if quality == "fast":
+                            key = "video_low_seconds"
+                        elif quality == "high":
+                            key = "video_high_seconds"
+                        else:
+                            key = "video_ultra_seconds"
+                        stage_metrics[key] = video_elapsed
+                        stage_metrics["video_seconds"] = video_elapsed
+                        msg = (
+                            f"[job {job_id}] {label} ({framing}) video render completed in {video_elapsed:.2f}s -> {video_path}"
+                        )
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        completed_video_jobs += 1
+                        percent_complete = (completed_video_jobs / total_video_jobs) * 100
+                        print(
+                            f"[job {job_id}] Video progress: {percent_complete:.0f}% complete",
+                            flush=True,
+                        )
+                    except RuntimeError as exc:
+                        logger.exception("job %s: video render (%s) failed", job_id, quality)
+                        errors.append(f"video_render_{label.replace('-', '_')}: {exc}")
+                        continue
+
+                    if not video_path.exists():
+                        errors.append(f"video_render_{label.replace('-', '_')}: output not produced")
+                        continue
+
+                    video_backup = Path(
+                        _dedupe_path(
+                            os.path.join(
+                                processed_dir,
+                                f"{safe_base_prefix}_{timestamp_suffix}_video_{label.replace('-', '_')}.mp4",
                             )
                         )
-                        shutil.copyfile(video_output_path, video_backup)
-                        logger.info("job %s: backed up video render to %s", job_id, video_backup)
-                        video_backup_path = video_backup
-                        video_filename = f"{safe_base_prefix}_video.mp4"
-                        video_key = compose_key(compose_base_path, video_filename)
-                        try:
-                            upload_result = upload_with_suffix_on_conflict(
-                                output_bucket, video_key, video_output_path
-                            )
-                            uploaded_assets["video_mp4"] = AssetSummary(
-                                object_key=upload_result["final_key"], size_bytes=upload_result["size_bytes"]
-                            )
-                            logger.info(
-                                "job %s: uploaded video output to %s/%s",
-                                job_id,
-                                output_bucket,
-                                upload_result["final_key"],
-                            )
-                        except SpacesCollisionError as exc:
-                            logger.error("job %s: collision uploading video render: %s", job_id, exc)
-                            raise HTTPException(
-                                status_code=409,
-                                detail={"job_id": job_id, "message": str(exc)},
-                            ) from exc
-                        except ClientError as exc:
-                            logger.exception("job %s: failed to upload video render", job_id)
-                            errors.append(f"video_upload: {exc}")
+                    )
+                    shutil.copyfile(video_path, video_backup)
+                    logger.info("job %s: backed up %s video render to %s", job_id, label, video_backup)
+                    video_backup_path = video_backup
+                    filename = f"{safe_base_prefix}_video_{label.replace('-', '_')}.mp4"
+                    video_key = compose_key(compose_base_path, filename)
+                    try:
+                        upload_result = upload_with_suffix_on_conflict(
+                            output_bucket, video_key, video_path
+                        )
+                        if quality == "fast":
+                            summary_key = "video_low_mp4"
+                        elif quality == "high":
+                            summary_key = "video_high_mp4"
+                        else:
+                            summary_key = "video_ultra_mp4"
+                        uploaded_assets[summary_key] = AssetSummary(
+                            object_key=upload_result["final_key"], size_bytes=upload_result["size_bytes"]
+                        )
+                        # Maintain legacy field for compatibility (prefer high quality)
+                        if (
+                            quality in ("high", "ultra")
+                            or "video_mp4" not in uploaded_assets
+                        ):
+                            uploaded_assets["video_mp4"] = uploaded_assets[summary_key]
+                        upload_msg = (
+                            f"[job {job_id}] {label} video uploaded -> {upload_result['final_key']}"
+                        )
+                        print(upload_msg, flush=True)
+                        logger.info(upload_msg)
+                        logger.info(
+                            "job %s: uploaded %s video output to %s/%s",
+                            job_id,
+                            label,
+                            output_bucket,
+                            upload_result["final_key"],
+                        )
+                    except SpacesCollisionError as exc:
+                        logger.error("job %s: collision uploading %s video render: %s", job_id, quality, exc)
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"job_id": job_id, "message": str(exc)},
+                        ) from exc
+                    except ClientError as exc:
+                        logger.exception("job %s: failed to upload %s video render", job_id, quality)
+                        errors.append(f"video_upload_{quality}: {exc}")
     except HTTPException:
         raise
     except Exception as exc:
@@ -793,8 +1197,8 @@ async def render_from_space(payload: Dict[str, Any]):
             "input_object_key": input_key,
             "input_size_bytes": input_size,
             "input_backup": _safe_relpath(input_backup_path),
-            "fast_backup": _safe_relpath(fast_backup_path),
-            "legacy_backup": _safe_relpath(legacy_backup_path),
+            "low_quality_backup": _safe_relpath(low_quality_backup_path),
+            "high_quality_backup": _safe_relpath(high_quality_backup_path),
             "video_backup": _safe_relpath(video_backup_path),
             "output_bucket": output_bucket,
             "base_path": final_base_path,
@@ -826,8 +1230,13 @@ async def render_from_space(payload: Dict[str, Any]):
         outputs=OutputSummary(
             bucket_name=output_bucket,
             base_path=final_base_path,
-            fast_png=uploaded_assets.get("fast_png"),
-            legacy_png=uploaded_assets.get("legacy_png"),
+            low_quality_png=uploaded_assets.get("low_quality_png"),
+            low_quality_canvas_png=uploaded_assets.get("low_quality_canvas_png"),
+            high_quality_png=uploaded_assets.get("high_quality_png"),
+            high_quality_canvas_png=uploaded_assets.get("high_quality_canvas_png"),
+            video_low_mp4=uploaded_assets.get("video_low_mp4"),
+            video_high_mp4=uploaded_assets.get("video_high_mp4"),
+            video_ultra_mp4=uploaded_assets.get("video_ultra_mp4"),
             video_mp4=uploaded_assets.get("video_mp4"),
         ),
         metrics=RenderMetrics(render_time_seconds_total=total_elapsed, stages=stage_metrics_model),

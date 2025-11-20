@@ -23,8 +23,7 @@ BlenderSetup.blend
 processing_log.csv
 
 # --- Output folders ---
-output/
-output2/
+output*/
 input_PES_finished/
 processed_files/
 pes_analysis/
@@ -38,3 +37,5 @@ Thumbs.db
 
 # --- Backups / Misc ---
 requirements copy.txt
+
+*.env

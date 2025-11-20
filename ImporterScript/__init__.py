@@ -30,6 +30,56 @@ thread_colors = []
 thread_color_cap_applied = False
 
 
+def srgb_channel_to_linear(channel: float) -> float:
+    """Convert a normalized sRGB channel into scene-linear space."""
+    channel = max(0.0, min(1.0, channel))
+    if channel <= 0.04045:
+        return channel / 12.92
+    return ((channel + 0.055) / 1.055) ** 2.4
+
+
+def srgb_bytes_to_linear(r: int, g: int, b: int):
+    """Return a tuple of scene-linear floats from byte RGB inputs."""
+    normalized = (r / 255.0, g / 255.0, b / 255.0)
+    return tuple(srgb_channel_to_linear(channel) for channel in normalized)
+
+
+def describe_thread(thread):
+    """Best-effort description for debug logging."""
+    for attr in ("description", "name", "catalog_number"):
+        value = getattr(thread, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def log_thread_palette(entries, declared_count, capped):
+    """Emit human-readable information about the current palette."""
+    shown = len(entries)
+    cap_text = "yes" if capped else "no"
+    print(
+        f"[Embroidery Importer] Thread palette preview "
+        f"({shown}/{declared_count} colors shown; cap_applied={cap_text})"
+    )
+    for entry in entries:
+        idx = entry["index"]
+        srgb = entry["srgb_255"]
+        linear = entry["linear"]
+        name = entry["name"]
+        prefix = f"  #{idx + 1:02d}"
+        if name:
+            prefix += f" ({name})"
+        rounded_linear = tuple(round(channel, 4) for channel in linear)
+        print(
+            f"{prefix}: sRGB {srgb} -> linear {rounded_linear}"
+        )
+    if declared_count > shown:
+        print(
+            f"[Embroidery Importer] {declared_count - shown} additional palette "
+            f"entries not listed (cap enforced)."
+        )
+
+
 def truncate(f, n):
     return floor(f * 10**n) / 10**n
 
@@ -257,18 +307,29 @@ def parse_embroidery_data(
         )
 
     if do_create_material:
-        raw_thread_colors = [
-            [
-                thread.get_red() / 255.0,
-                thread.get_green() / 255.0,
-                thread.get_blue() / 255.0,
-            ]
-            for thread in pattern.threadlist
-        ]
-        if not raw_thread_colors:
+        palette_entries = []
+        for idx, thread in enumerate(pattern.threadlist):
+            srgb_bytes = (
+                int(thread.get_red()),
+                int(thread.get_green()),
+                int(thread.get_blue()),
+            )
+            linear = srgb_bytes_to_linear(*srgb_bytes)
+            palette_entries.append(
+                {
+                    "index": idx,
+                    "srgb_255": srgb_bytes,
+                    "linear": linear,
+                    "name": describe_thread(thread),
+                }
+            )
+
+        if not palette_entries:
             thread_colors = [DEFAULT_THREAD_COLOR]
         else:
-            thread_colors = raw_thread_colors[:MAX_THREAD_COLORS]
+            truncated_entries = palette_entries[:MAX_THREAD_COLORS]
+            thread_colors = [entry["linear"] for entry in truncated_entries]
+            log_thread_palette(truncated_entries, declared_thread_count, thread_color_cap_applied)
 
     thread_index = 0  # start at the first thread
     sections = []  # list of sections, each section is a list of stitches

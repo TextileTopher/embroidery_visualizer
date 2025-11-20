@@ -295,11 +295,13 @@ def adjust_thread_material():
     if not bsdf_node:
         return
 
-    bsdf_node.inputs["Metallic"].default_value = 0.5
-    bsdf_node.inputs["Roughness"].default_value = 0.35
-    bsdf_node.inputs[18].default_value = 1.0
-    bsdf_node.inputs[19].default_value = 0.3
-    bsdf_node.inputs[20].default_value = 1.5
+    # Keep the material close to the PES palette by avoiding metallic shading
+    # and lowering roughness so colors stay punchy under Standard view transform.
+    bsdf_node.inputs["Metallic"].default_value = 0.0
+    bsdf_node.inputs["Roughness"].default_value = 0.25
+    bsdf_node.inputs[18].default_value = 0.0
+    bsdf_node.inputs[19].default_value = 0.0
+    bsdf_node.inputs[20].default_value = 1.0
 
 
 def enable_gpu_rendering(scene, samples_override=None, adaptive_sampling=True):
@@ -454,6 +456,12 @@ def render_single_image(
     configure_compositor_for_white_background(scene)
     hide_collections_for_clean_render()
     set_active_camera(scene, camera)
+    scene.display_settings.display_device = "sRGB"
+    view_settings = scene.view_settings
+    view_settings.view_transform = "Standard"
+    view_settings.look = "None"
+    view_settings.exposure = 0.0
+    view_settings.gamma = 1.0
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.resolution_percentage = 100
@@ -494,8 +502,8 @@ def main():
         cycles_samples=args.fast_samples,
     )
 
-    print(f"Render metrics: {metrics}")
-    print(f"Saved image: {output_image}")
+    print(f"Low-quality render metrics: {metrics}")
+    print(f"Saved low-quality image: {output_image}")
 
     if args.legacy_output:
         legacy_output = resolve_path(script_dir, args.legacy_output, "output")
@@ -503,7 +511,7 @@ def main():
             args.legacy_resolution if args.legacy_resolution else max(args.resolution * 2, args.resolution)
         )
         legacy_blend = args.blend_file if args.blend_file else os.path.join(script_dir, "BlenderSetup.blend")
-        print(f"Starting legacy render for comparison at resolution {legacy_resolution} -> {legacy_output}")
+        print(f"Starting high-quality render at resolution {legacy_resolution} -> {legacy_output}")
         legacy_metrics = render_single_image(
             input_pes_path=input_pes,
             output_image_path=legacy_output,
@@ -514,8 +522,8 @@ def main():
             quality="legacy",
             cycles_samples=args.legacy_samples,
         )
-        print(f"Legacy render metrics: {legacy_metrics}")
-        print(f"Legacy image saved: {legacy_output}")
+        print(f"High-quality render metrics: {legacy_metrics}")
+        print(f"High-quality image saved: {legacy_output}")
 
 
 if __name__ == "__main__":
